@@ -1,0 +1,34 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "ocr-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2024-12-30",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Enable observability for better debugging
+  "observability": {
+    "enabled": true
+  },
+
+  // Durable Object binding
+  "durable_objects": {
+    "bindings": [
+      { "name": "KLADOS_JOB", "class_name": "KladosJobDO" }
+    ]
+  },
+
+  // SQL storage for DO (required for SQL-backed DOs)
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["KladosJobDO"] }
+  ],
+
+  // Environment variables (non-secret)
+  "vars": {
+    "AGENT_ID": "IIKHS950E3PYKVMKXJX719Z3DV",
+    "AGENT_VERSION": "0.1.0"
+  }
+
+  // Secrets (set via `wrangler secret put`):
+  // - ARKE_AGENT_KEY: Your agent API key (ak_...)
+  // - MISTRAL_API_KEY: Mistral API key for OCR
+}

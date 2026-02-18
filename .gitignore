@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+.klados-state.json
+.klados-state.prod.json

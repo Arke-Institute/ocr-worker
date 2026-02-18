@@ -1,0 +1,14 @@
+{
+  "label": "OCR Worker",
+  "description": "Extracts text from JPEG images using Mistral OCR. Accepts any entity type with JPEG content.",
+  "endpoint": "https://ocr-worker.nick-chimicles-professional.workers.dev",
+  "actions_required": ["entity:view", "entity:create", "entity:update", "file:view", "file:create", "file:update"],
+  "accepts": {
+    "types": ["*"],
+    "cardinality": "one"
+  },
+  "produces": {
+    "types": ["file"],
+    "cardinality": "many"
+  }
+}
