@@ -21,6 +21,8 @@ import {
   readState,
   writeState,
   getStateFilePath,
+  findWorkspaceConfig,
+  resolveWorkspaceCollection,
   type KladosConfig,
   type KladosRegistrationState,
   type DryRunResult,
@@ -137,10 +139,35 @@ async function main() {
   // Create key store
   const keyStore = new CloudflareKeyStore(process.cwd());
 
+  // Check for workspace config (shared collection across kladoi)
+  const workspace = findWorkspaceConfig();
+  let collectionId: string | undefined;
+
+  if (workspace) {
+    console.log(`Found workspace config: ${workspace.path}`);
+    if (!isDryRun) {
+      const resolved = await resolveWorkspaceCollection(client, network, workspace.path);
+      collectionId = resolved.collectionId;
+      if (!resolved.created) {
+        console.log(`Using workspace collection: ${collectionId}`);
+      }
+    } else {
+      const networkConfig = workspace.config[network];
+      if (networkConfig.collection_id) {
+        collectionId = networkConfig.collection_id;
+        console.log(`Would use workspace collection: ${collectionId}`);
+      } else {
+        console.log(`Would create workspace collection: ${networkConfig.collection_label}`);
+      }
+    }
+    console.log('');
+  }
+
   try {
     // Sync klados
     const result = await syncKlados(client, config, state, {
       network,
+      collectionId,
       keyStore,
       dryRun: isDryRun,
       onDeploy: async () => {
