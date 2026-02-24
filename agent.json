@@ -1,8 +1,14 @@
 {
+  "schema_version": "1.0",
+
   "label": "OCR Worker",
-  "description": "Extracts text from JPEG images using Mistral OCR. Accepts any entity type with JPEG content.",
+  "description": "Extracts text from JPEG images using Mistral OCR, updating the source entity with extracted text and creating child entities for any embedded images.",
+
+  "detailed_description": "## Overview\n\nThe OCR Worker processes JPEG images to extract text content using Mistral's OCR API. It handles both simple text extraction and complex documents containing embedded images (figures, charts, diagrams).\n\n## How It Works\n\n1. Fetches the target entity and locates the JPEG file (via explicit key or auto-detection)\n2. Downloads the JPEG content from Arke's file storage\n3. Calls Mistral OCR API with the image (includes retry logic for rate limits)\n4. If embedded images are detected, creates child `file` entities for each with provenance tracking\n5. Transforms markdown output to use `arke:` URI references for embedded images\n6. Updates the source entity with extracted text and OCR metadata\n7. Returns the source entity ID for workflow handoff\n\n## When to Use\n\n- Processing scanned document pages (PDF split into JPEGs)\n- Extracting text from photographs of documents\n- OCR of screenshots or image-based content\n- As part of a PDF processing pipeline (after pdf-to-jpeg conversion)\n\n## Inline Image References\n\nWhen Mistral detects embedded images in the source JPEG, the OCR Worker:\n1. Creates separate `file` entities for each image with bounding box metadata\n2. Replaces Mistral's image references (e.g., `![img-0](img-0.jpeg)`) with Arke URIs (e.g., `![img-0](arke:ENTITY_ID)`)\n3. Adds `has_extracted` relationships from source to extracted images\n\nDownstream kladoi (like KG Extractor) can parse these `arke:` URIs to include images in their LLM context.\n\n## Limitations\n\n- Only accepts JPEG images (use image-converter for other formats)\n- Maximum file size: 20MB\n- Accuracy depends on image quality and Mistral OCR capabilities\n- Rate limited by Mistral API (retries with exponential backoff)",
+
   "endpoint": "https://ocr-worker.nick-chimicles-professional.workers.dev",
   "actions_required": ["entity:view", "entity:create", "entity:update", "file:view", "file:create", "file:update"],
+
   "accepts": {
     "types": ["*"],
     "cardinality": "one"
@@ -10,5 +16,436 @@
   "produces": {
     "types": ["file"],
     "cardinality": "many"
+  },
+
+  "input": {
+    "entity": {
+      "types": ["*"],
+      "types_description": "Any entity type that has a JPEG file attached. Common types include 'file', 'page', 'document', or 'image'. The entity must have JPEG content in its properties.content map.",
+
+      "properties": {
+        "required": {
+          "content": {
+            "type": "object",
+            "description": "File attachment map containing at least one JPEG file. Keys are file names, values are file metadata objects with cid, content_type, and size.",
+            "example": {
+              "image.jpeg": {
+                "cid": "bafkreiabc...",
+                "content_type": "image/jpeg",
+                "size": 1048576
+              }
+            }
+          }
+        },
+        "optional": {
+          "label": {
+            "type": "string",
+            "description": "Name of the source entity, preserved in extracted image labels"
+          }
+        }
+      },
+
+      "file": {
+        "required": true,
+        "mime_types": ["image/jpeg"],
+        "description": "JPEG image to perform OCR on. The worker auto-detects the first JPEG in properties.content, or uses the explicitly specified target_file_key.",
+        "max_size": "20MB"
+      },
+
+      "relationships": {
+        "required": {},
+        "optional": {
+          "part_of": {
+            "target_types": ["document", "pdf"],
+            "description": "If the JPEG is a page from a larger document, this relationship provides context for the page-assembler workflow."
+          }
+        }
+      }
+    },
+
+    "klados_input": {
+      "description": "Parameters passed via the rhiza workflow input field.",
+      "properties": {
+        "optional": {
+          "target_file_key": {
+            "type": "string",
+            "description": "Explicit file key to process from properties.content. If not provided, auto-detects the first JPEG file.",
+            "examples": ["page_001.jpeg", "scan.jpg", "content"]
+          }
+        }
+      }
+    },
+
+    "cardinality": "one"
+  },
+
+  "output": {
+    "entities": {
+      "creates": {
+        "types": ["file"],
+        "types_description": "Child file entities for embedded images extracted by Mistral OCR. Only created when the source JPEG contains detectable sub-images (figures, charts, diagrams, photographs within the scanned page).",
+
+        "properties": {
+          "guaranteed": {
+            "label": {
+              "type": "string",
+              "description": "Auto-generated label like 'extracted_img-0.jpeg'"
+            },
+            "extraction_source": {
+              "type": "string",
+              "description": "Always 'ocr' to indicate this image was extracted by OCR",
+              "enum": ["ocr"]
+            },
+            "source_file_key": {
+              "type": "string",
+              "description": "Which file key on the parent entity this was extracted from"
+            },
+            "source_image_ref": {
+              "type": "string",
+              "description": "Mistral's internal image reference (e.g., 'img-0', 'img-1')"
+            },
+            "extracted_at": {
+              "type": "string",
+              "description": "ISO 8601 timestamp of when extraction occurred"
+            }
+          },
+          "conditional": {
+            "source_bbox": {
+              "type": "object",
+              "description": "Bounding box coordinates from Mistral: {x1, y1, x2, y2} in pixels",
+              "condition": "When Mistral provides coordinate data (may be null for some images)",
+              "properties": {
+                "x1": { "type": "number", "description": "Top-left X coordinate" },
+                "y1": { "type": "number", "description": "Top-left Y coordinate" },
+                "x2": { "type": "number", "description": "Bottom-right X coordinate" },
+                "y2": { "type": "number", "description": "Bottom-right Y coordinate" }
+              }
+            }
+          }
+        },
+
+        "file_content": {
+          "mime_type": "image/jpeg",
+          "description": "The extracted image is uploaded as JPEG content to the entity"
+        },
+
+        "relationships": {
+          "extracted_from": {
+            "target": "source entity (the JPEG that was OCR'd)",
+            "direction": "outgoing",
+            "cardinality": "one",
+            "description": "Provenance link back to the source image"
+          }
+        }
+      },
+
+      "modifies": {
+        "target": "source entity (input entity)",
+        "description": "The source entity is updated with extracted text and OCR metadata.",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "OCR-extracted text in markdown format. Image references are transformed to arke: URIs."
+          },
+          "text_source": {
+            "type": "string",
+            "description": "Always 'ocr' to indicate text came from OCR",
+            "enum": ["ocr"]
+          },
+          "text_extracted_at": {
+            "type": "string",
+            "description": "ISO 8601 timestamp of extraction"
+          },
+          "ocr_model": {
+            "type": "string",
+            "description": "Model used for OCR (currently 'mistral-ocr-latest')"
+          },
+          "ocr_images_extracted": {
+            "type": "integer",
+            "description": "Number of embedded images extracted and saved as child entities"
+          },
+          "ocr_source_file_key": {
+            "type": "string",
+            "description": "Which file key was processed"
+          }
+        },
+        "relationships": {
+          "has_extracted": {
+            "target": "created file entities (extracted images)",
+            "direction": "outgoing",
+            "description": "Links to all images extracted from this source"
+          }
+        }
+      }
+    },
+
+    "handoff": {
+      "outputs": "Source entity ID (the entity that was OCR'd, now updated with text)",
+      "description": "Returns the source entity ID, allowing downstream kladoi to process the now-text-enriched entity. Typically feeds into text-chunker for document processing pipelines."
+    },
+
+    "cardinality": "zero_or_many"
+  },
+
+  "behavior": {
+    "processing": {
+      "tier": 2,
+      "tier_description": "Uses Durable Objects with SQL state persistence. Jobs survive worker restarts and can handle Mistral API latency without timeout issues.",
+      "typical_duration": "3-15 seconds for typical single-page JPEGs. Up to 60 seconds for large images or when Mistral is slow.",
+      "idempotent": false,
+      "idempotent_description": "Re-running OCR on the same entity will overwrite the text property and may create duplicate extracted image entities. Use caution when retrying."
+    },
+
+    "constraints": {
+      "file_size": {
+        "maximum": "20MB",
+        "description": "Files larger than 20MB will fail with an error"
+      },
+      "file_format": {
+        "required": "image/jpeg",
+        "description": "Only JPEG images are accepted. Convert other formats first."
+      },
+      "rate_limits": "Subject to Mistral API rate limits. Free tier has lower limits. Retries automatically with exponential backoff.",
+      "concurrency": "Safe to run multiple instances in parallel. Each job gets its own DO instance keyed by job_id."
+    },
+
+    "error_handling": {
+      "no_jpeg_found": {
+        "behavior": "Throws error",
+        "log_status": "error",
+        "message": "No JPEG file found on entity. Provide target_file_key or attach a JPEG."
+      },
+      "file_too_large": {
+        "behavior": "Throws error",
+        "log_status": "error",
+        "message": "File 'X' is too large (YMB). Maximum size is 20MB."
+      },
+      "wrong_mime_type": {
+        "behavior": "Throws error",
+        "log_status": "error",
+        "message": "File 'X' is not a JPEG (got Y)"
+      },
+      "mistral_api_error": {
+        "behavior": "Retries up to 3 times with exponential backoff for rate limits, timeouts, and 5xx errors",
+        "log_status": "error",
+        "message": "Mistral OCR failed after all retries"
+      },
+      "no_text_extracted": {
+        "behavior": "Completes successfully without updating text property",
+        "log_status": "done",
+        "message": "No text extracted from image"
+      },
+      "content_download_failed": {
+        "behavior": "Throws error",
+        "log_status": "error",
+        "message": "Failed to download content"
+      }
+    },
+
+    "side_effects": [
+      "Updates source entity with text and ocr_* properties",
+      "Creates file entities in target_collection for extracted images",
+      "Uploads JPEG content to extracted image entities",
+      "Adds has_extracted relationships from source to extracted images",
+      "Consumes Mistral API quota"
+    ]
+  },
+
+  "examples": [
+    {
+      "name": "Simple document page OCR",
+      "description": "OCR a scanned document page with no embedded images",
+
+      "input": {
+        "entity": {
+          "id": "PAGE_001",
+          "type": "page",
+          "properties": {
+            "label": "Invoice Page 1",
+            "content": {
+              "page.jpeg": {
+                "cid": "bafkreiabc...",
+                "content_type": "image/jpeg",
+                "size": 245760
+              }
+            }
+          }
+        },
+        "klados_input": {}
+      },
+
+      "output": {
+        "source_entity_modified": {
+          "properties_added": {
+            "text": "# INVOICE\n\nInvoice Number: INV-2024-001\nDate: January 15, 2024\n\n## Bill To:\nAcme Corporation\n123 Business Street\nNew York, NY 10001\n\n## Items:\n| Description | Quantity | Price |\n|-------------|----------|-------|\n| Widget A | 10 | $50.00 |\n| Widget B | 5 | $75.00 |\n\n**Total: $875.00**",
+            "text_source": "ocr",
+            "text_extracted_at": "2024-01-15T10:30:00.000Z",
+            "ocr_model": "mistral-ocr-latest",
+            "ocr_images_extracted": 0,
+            "ocr_source_file_key": "page.jpeg"
+          }
+        },
+        "entities_created": [],
+        "handoff_outputs": ["PAGE_001"]
+      }
+    },
+
+    {
+      "name": "Document page with embedded figure",
+      "description": "OCR a page containing a chart that gets extracted as a separate entity",
+
+      "input": {
+        "entity": {
+          "id": "REPORT_PAGE_5",
+          "type": "page",
+          "properties": {
+            "label": "Annual Report - Page 5",
+            "content": {
+              "scan.jpeg": {
+                "cid": "bafkreixyz...",
+                "content_type": "image/jpeg",
+                "size": 1572864
+              }
+            }
+          }
+        },
+        "klados_input": {}
+      },
+
+      "output": {
+        "source_entity_modified": {
+          "properties_added": {
+            "text": "## Financial Performance\n\nThe company achieved record revenue in Q4 2024, as shown in the chart below:\n\n![Revenue Chart](arke:EXTRACTED_IMG_001)\n\nKey highlights:\n- Revenue increased 25% year-over-year\n- Operating margin expanded to 18%\n- Customer count grew to 50,000",
+            "text_source": "ocr",
+            "text_extracted_at": "2024-01-15T10:35:00.000Z",
+            "ocr_model": "mistral-ocr-latest",
+            "ocr_images_extracted": 1,
+            "ocr_source_file_key": "scan.jpeg"
+          },
+          "relationships_added": [
+            { "predicate": "has_extracted", "peer": "EXTRACTED_IMG_001", "peer_type": "file" }
+          ]
+        },
+        "entities_created": [
+          {
+            "id": "EXTRACTED_IMG_001",
+            "type": "file",
+            "properties": {
+              "label": "extracted_img-0.jpeg",
+              "extraction_source": "ocr",
+              "source_file_key": "scan.jpeg",
+              "source_image_ref": "img-0",
+              "source_bbox": { "x1": 100, "y1": 200, "x2": 500, "y2": 400 },
+              "extracted_at": "2024-01-15T10:35:00.000Z"
+            },
+            "relationships": [
+              { "predicate": "extracted_from", "peer": "REPORT_PAGE_5", "peer_type": "page" }
+            ]
+          }
+        ],
+        "handoff_outputs": ["REPORT_PAGE_5"]
+      },
+
+      "notes": "The extracted chart image is now a separate entity that can be processed independently (e.g., chart analysis, image captioning). The arke: URI in the text allows downstream kladoi to fetch and include the image in their context."
+    },
+
+    {
+      "name": "Explicit file key selection",
+      "description": "Process a specific file when entity has multiple attachments",
+
+      "input": {
+        "entity": {
+          "id": "MULTI_FILE_DOC",
+          "type": "document",
+          "properties": {
+            "label": "Contract with signatures",
+            "content": {
+              "page1.jpeg": {
+                "cid": "bafkrei111...",
+                "content_type": "image/jpeg",
+                "size": 512000
+              },
+              "page2.jpeg": {
+                "cid": "bafkrei222...",
+                "content_type": "image/jpeg",
+                "size": 768000
+              },
+              "thumbnail.png": {
+                "cid": "bafkrei333...",
+                "content_type": "image/png",
+                "size": 25600
+              }
+            }
+          }
+        },
+        "klados_input": {
+          "target_file_key": "page2.jpeg"
+        }
+      },
+
+      "output": {
+        "source_entity_modified": {
+          "properties_added": {
+            "text": "## Signatures\n\nThis contract is agreed upon by:\n\n**Party A:** _______________\nJohn Smith, CEO\n\n**Party B:** _______________\nJane Doe, Director",
+            "text_source": "ocr",
+            "ocr_source_file_key": "page2.jpeg",
+            "ocr_images_extracted": 0
+          }
+        },
+        "handoff_outputs": ["MULTI_FILE_DOC"]
+      },
+
+      "notes": "When target_file_key is specified, only that file is processed. Without it, the worker would auto-select the first JPEG (page1.jpeg in this case)."
+    }
+  ],
+
+  "metadata": {
+    "version": "1.0.0",
+    "author": "Arke Institute",
+
+    "tags": ["ocr", "file-processing", "image", "jpeg", "text-extraction", "mistral", "tier-2"],
+
+    "related_kladoi": {
+      "prerequisites": [
+        {
+          "label": "Image Converter",
+          "description": "Convert PNG, WebP, or other image formats to JPEG",
+          "when": "Source image is not in JPEG format"
+        },
+        {
+          "label": "PDF to JPEG",
+          "description": "Split PDF into JPEG pages",
+          "when": "Processing a PDF document (scanned or digital)"
+        }
+      ],
+      "often_used_with": [
+        {
+          "label": "Text Chunker",
+          "description": "Split extracted text into chunks for downstream processing",
+          "when": "After OCR, to prepare text for knowledge extraction or embedding"
+        },
+        {
+          "label": "Page Assembler",
+          "description": "Combine text from multiple OCR'd pages into a single document",
+          "when": "Processing multi-page documents where each page was OCR'd separately"
+        }
+      ],
+      "workflows": [
+        {
+          "label": "jpeg-processing",
+          "description": "Single JPEG: OCR -> chunk -> extract"
+        },
+        {
+          "label": "pdf-processing",
+          "description": "PDF: split -> OCR each page -> assemble -> chunk -> extract"
+        }
+      ]
+    },
+
+    "costs": {
+      "api_calls": "1 Mistral OCR API call per invocation",
+      "typical_tokens": "Varies by image content. Mistral OCR pricing is per-image.",
+      "estimated_cost": "$0.01-0.05 per image depending on size and Mistral pricing tier"
+    }
   }
 }
