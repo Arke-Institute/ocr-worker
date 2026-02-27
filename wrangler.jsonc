@@ -24,11 +24,19 @@
 
   // Environment variables (non-secret)
   "vars": {
+    // Default (used as fallback)
     "AGENT_ID": "IIKHS950E3PYKVMKXJX719Z3DV",
+
+    // Network-specific IDs for dual-network deployment
+    "AGENT_ID_TEST": "IIKHS950E3PYKVMKXJX719Z3DV",
+    "AGENT_ID_MAIN": "01KJ6WQDQ0QRVG1VP5BJFBRG9N",
+
     "AGENT_VERSION": "0.1.0"
   }
 
   // Secrets (set via `wrangler secret put`):
-  // - ARKE_AGENT_KEY: Your agent API key (ak_...)
+  // - ARKE_AGENT_KEY: Default agent API key (fallback)
+  // - ARKE_AGENT_KEY_TEST: Test network klados key
+  // - ARKE_AGENT_KEY_MAIN: Main network klados key
   // - MISTRAL_API_KEY: Mistral API key for OCR
 }

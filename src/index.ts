@@ -9,7 +9,7 @@
  */
 
 import { Hono } from 'hono';
-import type { KladosRequest, KladosResponse } from '@arke-institute/rhiza';
+import { getKladosConfig, type KladosRequest, type KladosResponse } from '@arke-institute/rhiza';
 import { KladosJobDO } from './job-do';
 import type { Env } from './types';
 
@@ -58,6 +58,9 @@ app.post('/process', async (c) => {
   const doId = c.env.KLADOS_JOB.idFromName(req.job_id);
   const doStub = c.env.KLADOS_JOB.get(doId);
 
+  // Get network-aware config for dual-network deployment
+  const config = getKladosConfig(c.env, req.network);
+
   // Start the job in the DO
   const response = await doStub.fetch(
     new Request('https://do/start', {
@@ -65,11 +68,7 @@ app.post('/process', async (c) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         request: req,
-        config: {
-          agentId: c.env.AGENT_ID,
-          agentVersion: c.env.AGENT_VERSION,
-          authToken: c.env.ARKE_AGENT_KEY,
-        },
+        config,
       }),
     })
   );
