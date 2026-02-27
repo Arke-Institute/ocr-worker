@@ -41,6 +41,9 @@ export interface ProcessContext {
 
   /** Worker environment bindings (secrets, vars, DO namespaces) */
   env: Env;
+
+  /** Network-specific auth token (from getKladosConfig) */
+  authToken: string;
 }
 
 /**
@@ -256,7 +259,7 @@ async function createExtractedImage(
  * @returns Result with output entity IDs
  */
 export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
-  const { request, client, logger, env } = ctx;
+  const { request, client, logger, env, authToken } = ctx;
   const input = (request.input || {}) as OCRInput;
 
   logger.info('Starting OCR processing', {
@@ -374,7 +377,7 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
       },
       imageData,
       apiBase: request.api_base,
-      authToken: env.ARKE_AGENT_KEY,
+      authToken,
     });
 
     extractedEntities.push(childEntity.id);
