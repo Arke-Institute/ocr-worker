@@ -4,6 +4,14 @@
   "label": "OCR Worker",
   "description": "Extracts text from JPEG images using Mistral OCR, updating the source entity with extracted text and creating child entities for any embedded images.",
 
+  "match": {
+    "path": "properties.content",
+    "any": {
+      "path": "content_type",
+      "equals": "image/jpeg"
+    }
+  },
+
   "detailed_description": "## Overview\n\nThe OCR Worker processes JPEG images to extract text content using Mistral's OCR API. It handles both simple text extraction and complex documents containing embedded images (figures, charts, diagrams).\n\n## How It Works\n\n1. Fetches the target entity and locates the JPEG file (via explicit key or auto-detection)\n2. Downloads the JPEG content from Arke's file storage\n3. Calls Mistral OCR API with the image (includes retry logic for rate limits)\n4. If embedded images are detected, creates child `file` entities for each with provenance tracking\n5. Transforms markdown output to use `arke:` URI references for embedded images\n6. Updates the source entity with extracted text and OCR metadata\n7. Returns the source entity ID for workflow handoff\n\n## When to Use\n\n- Processing scanned document pages (PDF split into JPEGs)\n- Extracting text from photographs of documents\n- OCR of screenshots or image-based content\n- As part of a PDF processing pipeline (after pdf-to-jpeg conversion)\n\n## Inline Image References\n\nWhen Mistral detects embedded images in the source JPEG, the OCR Worker:\n1. Creates separate `file` entities for each image with bounding box metadata\n2. Replaces Mistral's image references (e.g., `![img-0](img-0.jpeg)`) with Arke URIs (e.g., `![img-0](arke:ENTITY_ID)`)\n3. Adds `has_extracted` relationships from source to extracted images\n\nDownstream kladoi (like KG Extractor) can parse these `arke:` URIs to include images in their LLM context.\n\n## Limitations\n\n- Only accepts JPEG images (use image-converter for other formats)\n- Maximum file size: 20MB\n- Accuracy depends on image quality and Mistral OCR capabilities\n- Rate limited by Mistral API (retries with exponential backoff)",
 
   "endpoint": "https://ocr-worker.nick-chimicles-professional.workers.dev",
