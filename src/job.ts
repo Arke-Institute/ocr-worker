@@ -198,7 +198,7 @@ async function createExtractedImage(
   } = opts;
 
   const properties: ExtractedImageProperties = {
-    label: `extracted_${sourceRef}.jpeg`,
+    label: `Extracted Image ${sourceRef.replace(/^img-/, '')}`,
     extraction_source: 'ocr',
     source_file_key: sourceFileKey,
     source_bbox: bbox,
