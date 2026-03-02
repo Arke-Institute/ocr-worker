@@ -448,10 +448,31 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
   }
 
   // =========================================================================
-  // Step 9: Return output (source entity updated)
+  // Step 9: Return outputs (source entity + extracted images)
   // =========================================================================
 
-  return {
-    outputs: [request.target_entity],
-  };
+  // Build outputs with routing properties for workflow routing
+  const outputs: Output[] = [];
+
+  // Source entity with text - routes to chunker (default path)
+  outputs.push({
+    entity_id: request.target_entity,
+    entity_class: 'text',
+  });
+
+  // Extracted images - route to describe service
+  for (const imageId of extractedEntities) {
+    outputs.push({
+      entity_id: imageId,
+      entity_class: 'extracted_image',
+    });
+  }
+
+  logger.info('Returning outputs', {
+    total: outputs.length,
+    textEntities: 1,
+    extractedImages: extractedEntities.length,
+  });
+
+  return { outputs };
 }
