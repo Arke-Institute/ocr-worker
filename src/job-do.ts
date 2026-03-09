@@ -239,6 +239,7 @@ export class KladosJobDO extends DurableObject<Env> {
       }
 
       // Handle workflow handoff if in a workflow
+      let handoffAction: string | undefined;
       if (request.rhiza && result.outputs) {
         // Fetch rhiza flow
         const { data: rhizaEntity, error: rhizaError } = await client.api.GET(
@@ -275,6 +276,8 @@ export class KladosJobDO extends DurableObject<Env> {
               authToken: config.authToken,
             });
 
+            handoffAction = handoffResult.action;
+
             if (handoffResult.handoffRecord) {
               await updateLogWithHandoffs(client, logFileId, [
                 handoffResult.handoffRecord,
@@ -290,9 +293,12 @@ export class KladosJobDO extends DurableObject<Env> {
       }
 
       // Finalize log
+      const isTerminal = !!(request.rhiza && (!handoffAction || handoffAction === 'done'));
       logger.success('Job completed');
       await updateLogStatus(client, logFileId, 'done', {
         messages: logger.getMessages(),
+        jobCollectionId: request.job_collection,
+        isTerminal,
       });
 
       this.sql.exec(`UPDATE job_state SET status = 'done' WHERE id = 1`);
@@ -308,6 +314,7 @@ export class KladosJobDO extends DurableObject<Env> {
           batchContext: request.rhiza?.batch,
           error,
           messages: logger.getMessages(),
+          jobCollectionId: request.job_collection,
         });
       }
 
