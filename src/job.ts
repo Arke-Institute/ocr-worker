@@ -249,14 +249,292 @@ async function createExtractedImage(
 }
 
 // =============================================================================
+// Single Page OCR
+// =============================================================================
+
+/**
+ * OCR a single JPEG entity and return its text + extracted images.
+ * Does NOT update the entity — caller is responsible for that.
+ */
+async function ocrSinglePage(
+  ctx: ProcessContext,
+  entityId: string,
+  targetFileKey?: string,
+): Promise<{
+  markdown: string;
+  extractedEntities: string[];
+  imageIdMap: Map<string, string>;
+}> {
+  const { request, client, logger, env, authToken } = ctx;
+
+  // Fetch entity
+  const { data: target, error: fetchError } = await client.api.GET(
+    '/entities/{id}',
+    { params: { path: { id: entityId } } },
+  );
+  if (fetchError || !target) {
+    throw new Error(`Failed to fetch entity: ${entityId}`);
+  }
+
+  // Resolve and validate JPEG
+  const { fileKey, fileMeta } = resolveJpegFile(
+    target as EntityWithContent,
+    targetFileKey,
+  );
+  if (fileMeta.size && fileMeta.size > MAX_FILE_SIZE) {
+    throw new Error(
+      `File '${fileKey}' too large (${Math.round(fileMeta.size / 1024 / 1024)}MB). Max ${MAX_FILE_SIZE / 1024 / 1024}MB.`,
+    );
+  }
+
+  // Download and OCR
+  const { data: contentData, error: contentError } = await client.api.GET(
+    '/entities/{id}/content',
+    {
+      params: {
+        path: { id: entityId },
+        query: { key: fileKey },
+      },
+      parseAs: 'arrayBuffer',
+    },
+  );
+  if (contentError || !contentData) {
+    throw new Error(`Failed to download content: ${JSON.stringify(contentError)}`);
+  }
+
+  const imageBase64 = arrayBufferToBase64(contentData as ArrayBuffer);
+  const ocrResult = await callMistralOCR(imageBase64, 'image/jpeg', env.MISTRAL_API_KEY);
+
+  // Create extracted image entities
+  const extractedEntities: string[] = [];
+  const imageIdMap = new Map<string, string>();
+
+  for (const img of ocrResult.images) {
+    if (!img.imageBase64) continue;
+    const imageData = decodeBase64DataUri(img.imageBase64);
+    const childEntity = await createExtractedImage(client, {
+      collection: request.target_collection,
+      parentId: entityId,
+      parentType: target.type,
+      sourceFileKey: fileKey,
+      sourceRef: img.id,
+      bbox: {
+        x1: img.topLeftX,
+        y1: img.topLeftY,
+        x2: img.bottomRightX,
+        y2: img.bottomRightY,
+      },
+      imageData,
+      apiBase: request.api_base,
+      authToken,
+    });
+    extractedEntities.push(childEntity.id);
+    imageIdMap.set(img.id, childEntity.id);
+  }
+
+  const transformedMarkdown = replaceImageRefs(ocrResult.markdown, imageIdMap);
+
+  return { markdown: transformedMarkdown, extractedEntities, imageIdMap };
+}
+
+/**
+ * Update an entity with OCR text results (CAS-safe)
+ */
+async function updateEntityWithOcrText(
+  client: ProcessContext['client'],
+  entityId: string,
+  markdown: string,
+  extractedEntities: string[],
+  fileKey: string,
+): Promise<void> {
+  if (markdown.trim().length === 0) return;
+
+  const { data: tipData, error: tipError } = await client.api.GET(
+    '/entities/{id}/tip',
+    { params: { path: { id: entityId } } },
+  );
+  if (tipError || !tipData) {
+    throw new Error(`Failed to get entity tip: ${JSON.stringify(tipError)}`);
+  }
+
+  const { error: updateError } = await client.api.PUT('/entities/{id}', {
+    params: { path: { id: entityId } },
+    body: {
+      expect_tip: tipData.cid,
+      properties: {
+        text: markdown,
+        text_source: 'ocr',
+        text_extracted_at: new Date().toISOString(),
+        ocr_model: 'mistral-ocr-latest',
+        ocr_images_extracted: extractedEntities.length,
+        ocr_source_file_key: fileKey,
+      },
+      relationships_add: extractedEntities.map((id) => ({
+        predicate: 'has_extracted',
+        peer: id,
+        peer_type: 'file',
+      })),
+    },
+  });
+
+  if (updateError) {
+    throw new Error(`Failed to update entity with OCR text: ${JSON.stringify(updateError)}`);
+  }
+}
+
+// =============================================================================
+// Page Group OCR
+// =============================================================================
+
+/**
+ * Process a page_group entity: OCR all pages in parallel, concatenate text,
+ * update both individual pages and the group entity.
+ */
+async function processPageGroup(ctx: ProcessContext): Promise<ProcessResult> {
+  const { request, client, logger } = ctx;
+  const groupEntityId = request.target_entity!;
+
+  // Fetch group entity (relationships included by default)
+  const { data: groupEntity, error: groupError } = await client.api.GET(
+    '/entities/{id}',
+    {
+      params: { path: { id: groupEntityId } },
+    },
+  );
+  if (groupError || !groupEntity) {
+    throw new Error(`Failed to fetch page_group: ${groupEntityId}`);
+  }
+
+  // Find contains_page relationships to get individual page entity IDs
+  const props = groupEntity.properties as Record<string, unknown>;
+  const pageNumbers = (props.page_numbers || []) as number[];
+  const relationships = (groupEntity.relationships || []) as Array<{
+    predicate: string;
+    peer: string;
+    properties?: Record<string, unknown>;
+  }>;
+  const pageRelationships = relationships.filter(r => r.predicate === 'contains_page');
+
+  if (pageRelationships.length === 0) {
+    throw new Error(`page_group ${groupEntityId} has no contains_page relationships`);
+  }
+
+  const pageEntityIds = pageRelationships.map(r => r.peer);
+
+  logger.info('Processing page group', {
+    groupId: groupEntityId,
+    pageCount: pageEntityIds.length,
+    pageNumbers,
+  });
+
+  // OCR all pages in parallel
+  const ocrResults = await Promise.all(
+    pageEntityIds.map(pageId => ocrSinglePage(ctx, pageId)),
+  );
+
+  // Fetch page entities to get page_number for ordering
+  const pageEntities = await Promise.all(
+    pageEntityIds.map(async (pageId) => {
+      const { data, error } = await client.api.GET('/entities/{id}', {
+        params: { path: { id: pageId } },
+      });
+      if (error || !data) throw new Error(`Failed to fetch page ${pageId}`);
+      const p = data.properties as Record<string, unknown>;
+      return { id: data.id, page_number: (p.page_number as number) || 0 };
+    }),
+  );
+
+  // Sort by page_number and build results in order
+  const indexed = pageEntityIds.map((id, i) => ({
+    id,
+    page_number: pageEntities[i].page_number,
+    ocr: ocrResults[i],
+  }));
+  indexed.sort((a, b) => a.page_number - b.page_number);
+
+  logger.info('OCR complete for all pages', {
+    pages: indexed.map(p => ({
+      page: p.page_number,
+      textLength: p.ocr.markdown.length,
+      images: p.ocr.extractedEntities.length,
+    })),
+  });
+
+  // Update individual page entities with their own OCR text
+  for (const page of indexed) {
+    await updateEntityWithOcrText(
+      client, page.id, page.ocr.markdown, page.ocr.extractedEntities, 'content',
+    );
+  }
+
+  // Build concatenated text with page markers (same format as digital mode)
+  const concatenatedText = indexed
+    .map(p => `--- Page ${p.page_number} ---\n${p.ocr.markdown}`)
+    .join('\n\n');
+
+  // Update the group entity with concatenated text
+  if (concatenatedText.trim().length > 0) {
+    const { data: tipData, error: tipError } = await client.api.GET(
+      '/entities/{id}/tip',
+      { params: { path: { id: groupEntityId } } },
+    );
+    if (tipError || !tipData) {
+      throw new Error(`Failed to get group tip: ${JSON.stringify(tipError)}`);
+    }
+
+    const allExtractedImages = indexed.flatMap(p => p.ocr.extractedEntities);
+
+    const { error: updateError } = await client.api.PUT('/entities/{id}', {
+      params: { path: { id: groupEntityId } },
+      body: {
+        expect_tip: tipData.cid,
+        properties: {
+          text: concatenatedText,
+          text_source: 'ocr',
+          text_extracted_at: new Date().toISOString(),
+          ocr_model: 'mistral-ocr-latest',
+          ocr_pages_processed: indexed.length,
+          ocr_images_extracted: allExtractedImages.length,
+        },
+      },
+    });
+
+    if (updateError) {
+      throw new Error(`Failed to update group with OCR text: ${JSON.stringify(updateError)}`);
+    }
+
+    logger.success('Updated page group with concatenated OCR text', {
+      textLength: concatenatedText.length,
+      pagesProcessed: indexed.length,
+      imagesExtracted: allExtractedImages.length,
+    });
+  }
+
+  // Build outputs: group entity + all extracted images from all pages
+  const outputs: Output[] = [];
+  outputs.push({ entity_id: groupEntityId, entity_class: 'text' });
+
+  for (const page of indexed) {
+    for (const imageId of page.ocr.extractedEntities) {
+      outputs.push({ entity_id: imageId, entity_class: 'extracted_image' });
+    }
+  }
+
+  logger.info('Returning outputs', {
+    total: outputs.length,
+    groupEntity: 1,
+    extractedImages: outputs.length - 1,
+  });
+
+  return { outputs };
+}
+
+// =============================================================================
 // Main Processing Function
 // =============================================================================
 
 /**
- * Process OCR job
- *
- * @param ctx - Processing context
- * @returns Result with output entity IDs
+ * Process OCR job - handles both single pages and page groups
  */
 export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
   const { request, client, logger, env, authToken } = ctx;
@@ -267,14 +545,13 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
     targetFileKey: input.target_file_key,
   });
 
-  // =========================================================================
-  // Step 1: Fetch target entity
-  // =========================================================================
-
   if (!request.target_entity) {
     throw new Error('No target_entity in request');
   }
 
+  // =========================================================================
+  // Check if target is a page_group
+  // =========================================================================
   const { data: target, error: fetchError } = await client.api.GET(
     '/entities/{id}',
     {
@@ -291,18 +568,20 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
     type: target.type,
   });
 
+  // Route to page group handler if applicable
+  if (target.type === 'page_group') {
+    logger.info('Detected page_group entity, processing as group');
+    return processPageGroup(ctx);
+  }
+
   // =========================================================================
-  // Step 2: Resolve JPEG file using file input conventions
+  // Single page processing (original flow)
   // =========================================================================
 
   const { fileKey, fileMeta } = resolveJpegFile(
     target as EntityWithContent,
     input.target_file_key
   );
-
-  // =========================================================================
-  // Step 3: Validate file size
-  // =========================================================================
 
   if (fileMeta.size && fileMeta.size > MAX_FILE_SIZE) {
     throw new Error(
@@ -313,159 +592,32 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
 
   logger.info('Processing JPEG', { fileKey, size: fileMeta.size });
 
-  // =========================================================================
-  // Step 4: Download JPEG content
-  // =========================================================================
-
-  const { data: contentData, error: contentError } = await client.api.GET(
-    '/entities/{id}/content',
-    {
-      params: {
-        path: { id: request.target_entity },
-        query: { key: fileKey },
-      },
-      parseAs: 'arrayBuffer',
-    }
+  const { markdown, extractedEntities } = await ocrSinglePage(
+    ctx,
+    request.target_entity,
+    input.target_file_key,
   );
 
-  if (contentError || !contentData) {
-    throw new Error(`Failed to download content: ${JSON.stringify(contentError)}`);
-  }
-
-  const imageBase64 = arrayBufferToBase64(contentData as ArrayBuffer);
-
-  // =========================================================================
-  // Step 5: Call Mistral OCR
-  // =========================================================================
-
-  logger.info('Calling Mistral OCR');
-  const ocrResult = await callMistralOCR(
-    imageBase64,
-    'image/jpeg',
-    env.MISTRAL_API_KEY
+  // Update source entity with OCR text
+  await updateEntityWithOcrText(
+    client, request.target_entity, markdown, extractedEntities, fileKey,
   );
-  logger.info('OCR complete', {
-    textLength: ocrResult.markdown.length,
-    imagesFound: ocrResult.images.length,
-  });
 
-  // =========================================================================
-  // Step 6: Create child entities for extracted images (if any)
-  // =========================================================================
-
-  const extractedEntities: string[] = [];
-  const imageIdMap = new Map<string, string>(); // mistral-id -> arke-entity-id
-
-  for (const img of ocrResult.images) {
-    if (!img.imageBase64) continue;
-
-    // Decode base64 data URI
-    const imageData = decodeBase64DataUri(img.imageBase64);
-
-    // Create child entity with provenance
-    const childEntity = await createExtractedImage(client, {
-      collection: request.target_collection,
-      parentId: request.target_entity,
-      parentType: target.type,
-      sourceFileKey: fileKey,
-      sourceRef: img.id,
-      bbox: {
-        x1: img.topLeftX,
-        y1: img.topLeftY,
-        x2: img.bottomRightX,
-        y2: img.bottomRightY,
-      },
-      imageData,
-      apiBase: request.api_base,
-      authToken,
-    });
-
-    extractedEntities.push(childEntity.id);
-    imageIdMap.set(img.id, childEntity.id);
-    logger.info('Created extracted image', {
-      entityId: childEntity.id,
-      sourceRef: img.id,
-    });
-  }
-
-  // =========================================================================
-  // Step 7: Transform markdown to use arke: URIs for extracted images
-  // =========================================================================
-
-  const transformedMarkdown = replaceImageRefs(ocrResult.markdown, imageIdMap);
-
-  // =========================================================================
-  // Step 8: Update source entity with OCR text (only if text exists)
-  // =========================================================================
-
-  if (transformedMarkdown.trim().length > 0) {
-    // Get current tip for CAS-safe update
-    const { data: tipData, error: tipError } = await client.api.GET(
-      '/entities/{id}/tip',
-      {
-        params: { path: { id: request.target_entity } },
-      }
-    );
-
-    if (tipError || !tipData) {
-      throw new Error(`Failed to get entity tip: ${JSON.stringify(tipError)}`);
-    }
-
-    // Update entity with OCR results
-    const { error: updateError } = await client.api.PUT('/entities/{id}', {
-      params: { path: { id: request.target_entity } },
-      body: {
-        expect_tip: tipData.cid,
-        properties: {
-          text: transformedMarkdown,
-          text_source: 'ocr',
-          text_extracted_at: new Date().toISOString(),
-          ocr_model: 'mistral-ocr-latest',
-          ocr_images_extracted: extractedEntities.length,
-          ocr_source_file_key: fileKey,
-        },
-        // Add relationships to extracted images
-        relationships_add: extractedEntities.map((id) => ({
-          predicate: 'has_extracted',
-          peer: id,
-          peer_type: 'file',
-        })),
-      },
-    });
-
-    if (updateError) {
-      throw new Error(
-        `Failed to update entity with OCR text: ${JSON.stringify(updateError)}`
-      );
-    }
-
+  if (markdown.trim().length > 0) {
     logger.success('Updated entity with OCR text', {
-      textLength: transformedMarkdown.length,
+      textLength: markdown.length,
       imagesExtracted: extractedEntities.length,
     });
   } else {
     logger.info('No text extracted from image');
   }
 
-  // =========================================================================
-  // Step 9: Return outputs (source entity + extracted images)
-  // =========================================================================
-
-  // Build outputs with routing properties for workflow routing
+  // Build outputs with routing properties
   const outputs: Output[] = [];
+  outputs.push({ entity_id: request.target_entity, entity_class: 'text' });
 
-  // Source entity with text - routes to chunker (default path)
-  outputs.push({
-    entity_id: request.target_entity,
-    entity_class: 'text',
-  });
-
-  // Extracted images - route to describe service
   for (const imageId of extractedEntities) {
-    outputs.push({
-      entity_id: imageId,
-      entity_class: 'extracted_image',
-    });
+    outputs.push({ entity_id: imageId, entity_class: 'extracted_image' });
   }
 
   logger.info('Returning outputs', {
