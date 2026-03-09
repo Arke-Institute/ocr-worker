@@ -460,9 +460,9 @@ async function processPageGroup(ctx: ProcessContext): Promise<ProcessResult> {
     );
   }
 
-  // Build concatenated text with page markers (same format as digital mode)
+  // Build concatenated text with page markers and arke: URIs
   const concatenatedText = indexed
-    .map(p => `--- Page ${p.page_number} ---\n${p.ocr.markdown}`)
+    .map(p => `--- [Page ${p.page_number}](arke:${p.id}) ---\n${p.ocr.markdown}`)
     .join('\n\n');
 
   // Update the group entity with concatenated text
