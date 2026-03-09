@@ -10,7 +10,7 @@
  */
 
 import type { ArkeClient } from '@arke-institute/sdk';
-import type { KladosLogger, KladosRequest, Output } from '@arke-institute/rhiza';
+import type { KladosJob, Output } from '@arke-institute/rhiza';
 import { callMistralOCR } from './mistral';
 import type {
   Env,
@@ -27,23 +27,14 @@ const MAX_FILE_SIZE = 20 * 1024 * 1024;
  * Context provided to processJob
  */
 export interface ProcessContext {
-  /** The original request */
-  request: KladosRequest;
-
-  /** Arke client for API calls */
-  client: ArkeClient;
-
-  /** Logger for messages (stored in the klados_log) */
-  logger: KladosLogger;
+  /** KladosJob instance (provides client, logger, request, fetchTarget, etc.) */
+  job: KladosJob;
 
   /** SQLite storage for checkpointing long operations */
   sql: SqlStorage;
 
   /** Worker environment bindings (secrets, vars, DO namespaces) */
   env: Env;
-
-  /** Network-specific auth token (from getKladosConfig) */
-  authToken: string;
 }
 
 /**
@@ -265,7 +256,9 @@ async function ocrSinglePage(
   extractedEntities: string[];
   imageIdMap: Map<string, string>;
 }> {
-  const { request, client, logger, env, authToken } = ctx;
+  const { job, env } = ctx;
+  const { request, client, log: logger } = job;
+  const authToken = job.config.authToken!;
 
   // Fetch entity
   const { data: target, error: fetchError } = await client.api.GET(
@@ -341,7 +334,7 @@ async function ocrSinglePage(
  * Update an entity with OCR text results (CAS-safe)
  */
 async function updateEntityWithOcrText(
-  client: ProcessContext['client'],
+  client: ArkeClient,
   entityId: string,
   markdown: string,
   extractedEntities: string[],
@@ -391,7 +384,7 @@ async function updateEntityWithOcrText(
  * update both individual pages and the group entity.
  */
 async function processPageGroup(ctx: ProcessContext): Promise<ProcessResult> {
-  const { request, client, logger } = ctx;
+  const { request, client, log: logger } = ctx.job;
   const groupEntityId = request.target_entity!;
 
   // Fetch group entity (relationships included by default)
@@ -537,7 +530,8 @@ async function processPageGroup(ctx: ProcessContext): Promise<ProcessResult> {
  * Process OCR job - handles both single pages and page groups
  */
 export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
-  const { request, client, logger, env, authToken } = ctx;
+  const { job, env } = ctx;
+  const { request, client, log: logger } = job;
   const input = (request.input || {}) as OCRInput;
 
   logger.info('Starting OCR processing', {
