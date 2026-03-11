@@ -72,14 +72,13 @@
     },
 
     "klados_input": {
-      "description": "Parameters passed via the rhiza workflow input field.",
+      "description": "Parameters passed via the rhiza workflow input field. Properties map directly to keys in request.input.",
       "properties": {
-        "optional": {
-          "target_file_key": {
-            "type": "string",
-            "description": "Explicit file key to process from properties.content. If not provided, auto-detects the first JPEG file.",
-            "examples": ["page_001.jpeg", "scan.jpg", "content"]
-          }
+        "target_file_key": {
+          "type": "string",
+          "required": false,
+          "description": "Explicit file key to process from properties.content. If not provided, auto-detects the first JPEG file.",
+          "examples": ["page_001.jpeg", "scan.jpg", "content"]
         }
       }
     },
