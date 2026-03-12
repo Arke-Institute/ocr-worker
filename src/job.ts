@@ -23,6 +23,38 @@ import type {
 /** Maximum file size for OCR processing (20MB) */
 const MAX_FILE_SIZE = 20 * 1024 * 1024;
 
+/** Max concurrent Mistral OCR calls per DO to avoid rate limiting */
+const OCR_CONCURRENCY = 3;
+
+/**
+ * Sleep for specified milliseconds
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Run async operations with limited concurrency
+ */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  fn: (item: T) => Promise<R>,
+  concurrency: number,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const idx = next++;
+      results[idx] = await fn(items[idx]);
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, items.length) }, () => worker()),
+  );
+  return results;
+}
+
 /**
  * Context provided to processJob
  */
@@ -420,9 +452,11 @@ async function processPageGroup(ctx: ProcessContext): Promise<ProcessResult> {
     pageNumbers,
   });
 
-  // OCR all pages in parallel
-  const ocrResults = await Promise.all(
-    pageEntityIds.map(pageId => ocrSinglePage(ctx, pageId)),
+  // OCR pages with limited concurrency to avoid Mistral rate limits
+  const ocrResults = await mapWithConcurrency(
+    pageEntityIds,
+    (pageId) => ocrSinglePage(ctx, pageId),
+    OCR_CONCURRENCY,
   );
 
   // Fetch page entities to get page_number for ordering
@@ -534,10 +568,14 @@ export async function processJob(ctx: ProcessContext): Promise<ProcessResult> {
   const { request, client, log: logger } = job;
   const input = (request.input || {}) as OCRInput;
 
+  // Stagger start to avoid thundering herd across DOs
+  const staggerMs = Math.round(Math.random() * 2000);
   logger.info('Starting OCR processing', {
     target: request.target_entity,
     targetFileKey: input.target_file_key,
+    staggerMs,
   });
+  await sleep(staggerMs);
 
   if (!request.target_entity) {
     throw new Error('No target_entity in request');
